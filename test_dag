@@ -1,0 +1,142 @@
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime
+import msal
+from github import Github
+
+# Azure AD (Entra ID) credentials and settings
+TENANT_ID = 'your-tenant-id'
+CLIENT_ID = 'your-client-id'
+CLIENT_SECRET = 'your-client-secret'
+GROUP_ID = 'your-entra-group-id'  # The group where you want to add the user
+AUTHORITY_URL = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPES = ['https://graph.microsoft.com/.default']
+
+# GitHub credentials and settings
+GITHUB_ACCESS_TOKEN = 'your-github-access-token'
+
+# Function to authenticate and create a new user in Entra ID
+def create_azure_user():
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY_URL,
+        client_credential=CLIENT_SECRET
+    )
+    
+    # Get token to call Graph API
+    result = app.acquire_token_for_client(SCOPES)
+    
+    if 'access_token' not in result:
+        raise Exception(f"Could not authenticate to Azure AD: {result}")
+    
+    # Headers and body for creating a user
+    headers = {
+        'Authorization': f"Bearer {result['access_token']}",
+        'Content-Type': 'application/json'
+    }
+    
+    user_data = {
+        "accountEnabled": True,
+        "displayName": "mynewuser",
+        "mailNickname": "mynewuser",
+        "userPrincipalName": "mynewuser@yourdomain.com",
+        "passwordProfile": {
+            "password": "P@ssw0rd123!",
+            "forceChangePasswordNextSignIn": False
+        }
+    }
+    
+    # Make the request to create the user
+    response = requests.post(
+        'https://graph.microsoft.com/v1.0/users',
+        headers=headers,
+        json=user_data
+    )
+    
+    if response.status_code != 201:
+        raise Exception(f"Error creating user: {response.text}")
+    
+    user_id = response.json().get('id')
+    return user_id
+
+# Function to add the new user to a group in Entra ID
+def add_user_to_group(**kwargs):
+    user_id = kwargs['ti'].xcom_pull(task_ids='create_azure_user')
+    
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY_URL,
+        client_credential=CLIENT_SECRET
+    )
+    
+    # Get token to call Graph API
+    result = app.acquire_token_for_client(SCOPES)
+    
+    if 'access_token' not in result:
+        raise Exception(f"Could not authenticate to Azure AD: {result}")
+    
+    # Add user to group
+    headers = {
+        'Authorization': f"Bearer {result['access_token']}",
+        'Content-Type': 'application/json'
+    }
+    
+    group_data = {
+        "@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
+    }
+    
+    response = requests.post(
+        f'https://graph.microsoft.com/v1.0/groups/{GROUP_ID}/members/$ref',
+        headers=headers,
+        json=group_data
+    )
+    
+    if response.status_code != 204:
+        raise Exception(f"Error adding user to group: {response.text}")
+
+# Function to create a GitHub repository
+def create_github_repo():
+    g = Github(GITHUB_ACCESS_TOKEN)
+    
+    # Get the authenticated user
+    user = g.get_user()
+    
+    # Create the repository
+    repo = user.create_repo(
+        name="My_new_repo",
+        description="This is my new repository created from Airflow DAG",
+        private=False
+    )
+    
+    return repo.full_name
+
+# Define the DAG
+default_args = {
+    'owner': 'airflow',
+    'start_date': datetime(2024, 1, 1),
+    'retries': 1,
+}
+
+with DAG('entra_id_github_dag', default_args=default_args, schedule_interval=None) as dag:
+    
+    # Task to create a user in Azure AD
+    create_azure_user_task = PythonOperator(
+        task_id='create_azure_user',
+        python_callable=create_azure_user
+    )
+    
+    # Task to add the new user to a group
+    add_user_to_group_task = PythonOperator(
+        task_id='add_user_to_group',
+        python_callable=add_user_to_group,
+        provide_context=True
+    )
+    
+    # Task to create a GitHub repository
+    create_github_repo_task = PythonOperator(
+        task_id='create_github_repo',
+        python_callable=create_github_repo
+    )
+    
+    # DAG dependencies
+    create_azure_user_task >> add_user_to_group_task >> create_github_repo_task
